@@ -1,0 +1,1057 @@
+package com.handicap;
+
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+import net.minecraft.ChatFormatting;
+import net.minecraft.commands.Commands;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.Holder;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.HumanoidArm;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.entity.ai.attributes.Attribute;
+import net.minecraft.world.entity.ai.attributes.AttributeInstance;
+import net.minecraft.world.entity.ai.attributes.AttributeModifier;
+import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+public final class HandicapManager {
+	private static HandicapState state;
+	private static MinecraftServer server;
+	private static boolean syncing;
+	private static int syncedTick = -1;
+	private static final Map<UUID, Runtime> RUNTIME = new HashMap<>();
+	private static final EquipmentSlot[] ARMOR_SLOTS = {
+		EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET
+	};
+
+	private static final String[] TOURETTE_WORDS = {
+		"BEEP!", "YES YES YES", "POTATO!", "AAAAH", "no no no", "BOOM", "HEY!", "*squeak*"
+	};
+
+	private static final class Runtime {
+		int cancerSeconds;
+		int sprintSeconds;
+		int windedSeconds;
+		int narcoSeconds;
+		boolean blindApplied;
+		int hypoSeconds;
+		int idleSeconds;
+		int numbSeconds;
+		double lastX;
+		double lastZ;
+		int clumsyCooldown;
+		int phobiaSeconds;
+		int claustroSeconds;
+		int reflexSeconds;
+		int sleepSeconds;
+		boolean apneaRolled;
+		boolean apneaWake;
+		int apneaWakeAt;
+		int apneaSlow;
+		int gamblingTimer = 60;
+		int doomTimer = 90;
+		int doomActive;
+		int procrastinationTimer = 35;
+		int procrastinationActive;
+		int paranoiaTimer = 20;
+		int shoppingTimer = 90;
+		int inventoryChaosTimer = 30;
+		int indecisionTimer = 25;
+		int indecisionActive;
+		int badLuckTimer = 45;
+		int distractionTimer = 30;
+		int distractionActive;
+		int fomoTimer = 55;
+		int overthinkingTimer = 20;
+
+		ItemStack useItem;
+		int useRemaining;
+
+		float lastHealth = -1f;
+		int seizureSeconds;
+
+		int ocdType;
+		int ocdRemaining;
+		int ocdDeadline;
+		int ocdCooldown = 30;
+		boolean ocdPunishing;
+		boolean lastOnGround = true;
+		boolean lastSneak;
+
+		int lastLimbs = -1;
+		int wheelchairHint;
+		int announceHold;
+	}
+
+	private HandicapManager() {
+	}
+
+	public static HandicapState state() {
+		return state;
+	}
+
+	// ---- Loader hooks: each loader module forwards its own events here. ----
+
+	public static void onServerStarted(MinecraftServer s) {
+		server = s;
+		state = HandicapState.load(s);
+		RUNTIME.clear();
+	}
+
+	public static void onServerStopping() {
+		if (state != null) {
+			state.save();
+		}
+	}
+
+	public static void onServerStopped() {
+		state = null;
+		server = null;
+		RUNTIME.clear();
+	}
+
+	public static void onPlayerJoin(ServerPlayer player) {
+		RUNTIME.remove(player.getUUID());
+		for (Runtime other : RUNTIME.values()) {
+			other.lastLimbs = -1;
+		}
+		if (state != null && server != null && state.sync()) {
+			for (ServerPlayer other : server.getPlayerList().getPlayers()) {
+				if (other != player) {
+					match(player, other);
+					break;
+				}
+			}
+		}
+	}
+
+	private static void match(ServerPlayer target, ServerPlayer source) {
+		boolean was = syncing;
+		syncing = true;
+		Set<Handicap> wanted = state.get(source.getUUID());
+		for (Handicap d : state.get(target.getUUID())) {
+			if (!wanted.contains(d)) {
+				remove(target, d, false);
+			}
+		}
+		for (Handicap d : wanted) {
+			give(target, d, false);
+		}
+		syncing = was;
+	}
+
+	public static void applySetting(ServerPlayer p, String key, int value) {
+		if (key.equals("permission") || key.equals("descriptions")) {
+			if (server == null || !(server.isSingleplayerOwner(p.nameAndId())
+					|| Commands.hasPermission(Commands.LEVEL_GAMEMASTERS).test(p.createCommandSourceStack()))) {
+				return;
+			}
+			if (key.equals("permission")) {
+				HandicapConfig.setPermissionLevel(value == 0 ? 0 : 2);
+			} else {
+				HandicapConfig.setShowDescriptions(value == 1);
+			}
+			HandicapConfig.save();
+			for (ServerPlayer other : new ArrayList<>(server.getPlayerList().getPlayers())) {
+				server.getCommands().sendCommands(other);
+				refresh(other);
+			}
+			return;
+		}
+		if (state == null || server == null || !HandicapConfig.allows(p.createCommandSourceStack())) {
+			return;
+		}
+		List<ServerPlayer> players = new ArrayList<>(server.getPlayerList().getPlayers());
+		switch (key) {
+			case "stacking" -> state.setStacking(value == 1);
+			case "timer" -> {
+				if (value <= 0) {
+					state.setTimerEnabled(false);
+				} else {
+					state.setTimerSeconds(Math.max(5, value));
+				}
+			}
+			case "max" -> state.setMaxHandicaps(Math.max(0, value));
+			case "duration" -> state.setDurationSeconds(value <= 0 ? 0 : Math.max(5, value));
+			case "sync" -> {
+				state.setSync(value == 1);
+				if (value == 1) {
+					for (ServerPlayer other : players) {
+						if (other != p) {
+							match(other, p);
+						}
+					}
+				}
+			}
+			default -> {
+				Handicap d = key.startsWith("disable:") ? Handicap.byId(key.substring(8)) : null;
+				if (d == null) {
+					return;
+				}
+				if (value == 1) {
+					for (ServerPlayer other : players) {
+						remove(other, d, true);
+					}
+				}
+				state.setDisabled(d, value == 1);
+			}
+		}
+		state.save();
+		for (ServerPlayer other : players) {
+			refresh(other);
+		}
+	}
+
+	/** Returns false if the chat message must be blocked (Mute). */
+	public static boolean allowChat(ServerPlayer sender) {
+		if (state != null && state.has(sender.getUUID(), Handicap.MUTE)) {
+			sender.sendOverlayMessage(Component.literal("Sei muto: non puoi parlare."));
+			return false;
+		}
+		return true;
+	}
+
+	public static boolean give(ServerPlayer p, Handicap d, boolean announce) {
+		if (state.isDisabled(d)) {
+			return false;
+		}
+		if (announce && !state.stacking()) {
+			for (Handicap other : state.get(p.getUUID())) {
+				if (other != d) {
+					state.remove(p.getUUID(), other);
+				}
+			}
+		}
+		if (!state.give(p.getUUID(), d)) {
+			return false;
+		}
+		if (announce) {
+			enforceMax(p, d);
+		}
+		if (d == Handicap.AMPUTATED_LEG) {
+			state.setLegSide(p.getUUID(), p.getRandom().nextInt(2));
+		}
+		if (announce && !state.has(p.getUUID(), Handicap.ANOSOGNOSIA)) {
+			announceNew(p, d);
+		}
+		if ((d == Handicap.PARAPLEGIA || d == Handicap.AMPUTATED_LEG)
+			&& state.has(p.getUUID(), Handicap.PARAPLEGIA) && state.has(p.getUUID(), Handicap.AMPUTATED_LEG)) {
+			RUNTIME.computeIfAbsent(p.getUUID(), k -> new Runtime()).wheelchairHint = 8;
+		}
+		refresh(p);
+		if (state.sync() && !syncing && server != null) {
+			syncing = true;
+			for (ServerPlayer other : new ArrayList<>(server.getPlayerList().getPlayers())) {
+				if (other != p) {
+					give(other, d, announce);
+				}
+			}
+			syncing = false;
+		}
+		return true;
+	}
+
+	private static void enforceMax(ServerPlayer p, Handicap keep) {
+		if (state.maxHandicaps() > 0) {
+			trim(p, state.maxHandicaps(), keep);
+		}
+	}
+
+	private static void trim(ServerPlayer p, int max, Handicap keep) {
+		while (state.get(p.getUUID()).size() > max) {
+			Handicap oldest = state.oldest(p.getUUID(), keep);
+			if (oldest == null || !state.remove(p.getUUID(), oldest)) {
+				return;
+			}
+		}
+	}
+
+	private static void tickDurations(ServerPlayer p) {
+		UUID id = p.getUUID();
+		state.ageAll(id);
+		int duration = state.durationSeconds();
+		if (duration <= 0) {
+			return;
+		}
+		for (Handicap d : state.get(id)) {
+			if (state.age(id, d) >= duration) {
+				remove(p, d, true);
+			}
+		}
+	}
+
+	private static void announceNew(ServerPlayer p, Handicap d) {
+		announce(p, Component.literal(d.displayName).withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
+	}
+
+	public static boolean remove(ServerPlayer p, Handicap d, boolean announce) {
+		if (!state.remove(p.getUUID(), d)) {
+			return false;
+		}
+		if (announce && !state.has(p.getUUID(), Handicap.ANOSOGNOSIA)) {
+			announce(p, Component.literal("Handicap rimosso: " + d.displayName).withStyle(ChatFormatting.GREEN));
+		}
+		refresh(p);
+		if (state.sync() && !syncing && server != null) {
+			syncing = true;
+			for (ServerPlayer other : new ArrayList<>(server.getPlayerList().getPlayers())) {
+				if (other != p) {
+					remove(other, d, announce);
+				}
+			}
+			syncing = false;
+		}
+		return true;
+	}
+
+	public static Handicap giveRandom(ServerPlayer p) {
+		if (state.sync() && server != null) {
+			if (server.getTickCount() == syncedTick) {
+				return null;
+			}
+			syncedTick = server.getTickCount();
+		}
+		int limit = state.stacking() ? state.maxHandicaps() : 1;
+		if (limit > 0) {
+			trim(p, limit - 1, null);
+		}
+		List<Handicap> available = new ArrayList<>();
+		for (Handicap d : Handicap.values()) {
+			if (!state.has(p.getUUID(), d) && !state.isDisabled(d)) {
+				available.add(d);
+			}
+		}
+		if (available.isEmpty()) {
+			p.sendSystemMessage(Component.literal("You already have every handicap!").withStyle(ChatFormatting.GRAY));
+			return null;
+		}
+		Handicap d = available.get(p.getRandom().nextInt(available.size()));
+		give(p, d, true);
+		return d;
+	}
+
+	public static Handicap removeRandom(ServerPlayer p) {
+		List<Handicap> owned = new ArrayList<>(state.get(p.getUUID()));
+		if (owned.isEmpty()) {
+			return null;
+		}
+		Handicap d = owned.get(p.getRandom().nextInt(owned.size()));
+		remove(p, d, true);
+		return d;
+	}
+
+	public static void refresh(ServerPlayer p) {
+		if (state != null && server != null) {
+			tickPlayer(p);
+		}
+	}
+
+	public static void onServerTick(MinecraftServer s) {
+		if (state == null) {
+			return;
+		}
+		List<ServerPlayer> players = s.getPlayerList().getPlayers();
+		if (players.isEmpty()) {
+			return;
+		}
+
+		if (state.timerEnabled() && state.tickTimer()) {
+			for (ServerPlayer p : new ArrayList<>(players)) {
+				giveRandom(p);
+			}
+			state.save();
+		}
+
+		for (ServerPlayer p : new ArrayList<>(players)) {
+			tickFast(p);
+		}
+
+		int tick = s.getTickCount();
+		if (tick % 20 == 0) {
+			for (ServerPlayer p : new ArrayList<>(players)) {
+				tickDurations(p);
+				tickPlayer(p);
+			}
+		}
+		if (tick % 6000 == 0) {
+			state.save();
+		}
+	}
+
+	private static void tickPlayer(ServerPlayer p) {
+		UUID id = p.getUUID();
+		Set<Handicap> set = state.get(id);
+		Runtime rt = RUNTIME.computeIfAbsent(id, k -> new Runtime());
+		RandomSource rnd = p.getRandom();
+
+		boolean isShort = set.contains(Handicap.SHORT);
+		setModifier(p, Attributes.SCALE, "short_scale", -0.55, AttributeModifier.Operation.ADD_MULTIPLIED_BASE, isShort);
+		setModifier(p, Attributes.BLOCK_INTERACTION_RANGE, "short_block_reach", -1.0, AttributeModifier.Operation.ADD_VALUE, isShort);
+		setModifier(p, Attributes.ENTITY_INTERACTION_RANGE, "short_entity_reach", -0.75, AttributeModifier.Operation.ADD_VALUE, isShort);
+		setModifier(p, Attributes.JUMP_STRENGTH, "short_jump", -0.55, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, isShort);
+		setModifier(p, Attributes.MAX_HEALTH, "short_health", -10.0, AttributeModifier.Operation.ADD_VALUE, isShort);
+
+		boolean arthritis = set.contains(Handicap.ARTHRITIS);
+		setModifier(p, Attributes.BLOCK_BREAK_SPEED, "arthritis_mining", -0.5, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, arthritis);
+		setModifier(p, Attributes.ATTACK_SPEED, "arthritis_attack", -0.35, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, arthritis);
+
+		setModifier(p, Attributes.FALL_DAMAGE_MULTIPLIER, "brittle_bones", 1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			set.contains(Handicap.BRITTLE_BONES));
+
+		int stage = state.cancerStage(id);
+		if (set.contains(Handicap.CANCER)) {
+			rt.cancerSeconds++;
+			if (rt.cancerSeconds >= 60) {
+				rt.cancerSeconds = 0;
+				if (stage < 9) {
+					stage++;
+					state.setCancerStage(id, stage);
+					overlay(p, Component.literal("La tua salute sta peggiorando..."));
+				}
+			}
+		} else {
+			rt.cancerSeconds = 0;
+			if (stage != 0) {
+				state.setCancerStage(id, 0);
+				stage = 0;
+			}
+		}
+		setModifier(p, Attributes.MAX_HEALTH, "cancer_health", -2.0 * stage, AttributeModifier.Operation.ADD_VALUE,
+			set.contains(Handicap.CANCER) && stage > 0);
+
+		if (!set.contains(Handicap.ASTHMA)) {
+			rt.sprintSeconds = 0;
+			rt.windedSeconds = 0;
+		} else if (rt.windedSeconds > 0) {
+			rt.windedSeconds--;
+			p.setSprinting(false);
+		} else if (p.isSprinting()) {
+			rt.sprintSeconds++;
+			if (rt.sprintSeconds >= 10) {
+				rt.sprintSeconds = 0;
+				rt.windedSeconds = 8;
+				p.setSprinting(false);
+				overlay(p, Component.literal("Sei senza fiato!"));
+			}
+		} else {
+			rt.sprintSeconds = Math.max(0, rt.sprintSeconds - 2);
+		}
+		setModifier(p, Attributes.MOVEMENT_SPEED, "asthma_winded", -0.5, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.windedSeconds > 0);
+
+		if (!set.contains(Handicap.NARCOLEPSY)) {
+			rt.narcoSeconds = 0;
+		} else if (rt.narcoSeconds > 0) {
+			rt.narcoSeconds--;
+		} else if (rnd.nextInt(45) == 0) {
+			rt.narcoSeconds = 8;
+			p.addEffect(new MobEffectInstance(MobEffects.BLINDNESS, 180, 0, false, false, false));
+			overlay(p, Component.literal("Ti stai addormentando... Zzz..."));
+		}
+		if (set.contains(Handicap.BLIND)) {
+			p.addEffect(new MobEffectInstance(MobEffects.BLINDNESS, 260, 0, false, false, false));
+			rt.blindApplied = true;
+		} else if (rt.blindApplied) {
+			p.removeEffect(MobEffects.BLINDNESS);
+			rt.blindApplied = false;
+		}
+
+		boolean asleep = rt.narcoSeconds > 0;
+		setModifier(p, Attributes.MOVEMENT_SPEED, "narcolepsy_move", -1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, asleep);
+		setModifier(p, Attributes.JUMP_STRENGTH, "narcolepsy_jump", -1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, asleep);
+
+		if (set.contains(Handicap.INSOMNIA) && p.isSleeping()) {
+			p.stopSleepInBed(true, true);
+			overlay(p, Component.literal("Non riesci ad addormentarti."));
+		}
+
+		if (set.contains(Handicap.AMPUTATED_OFFHAND)) {
+			ItemStack off = p.getOffhandItem();
+			if (!off.isEmpty()) {
+				ItemStack copy = off.copy();
+				p.setItemInHand(InteractionHand.OFF_HAND, ItemStack.EMPTY);
+				if (!p.getInventory().add(copy)) {
+					dropItem(p, copy);
+				}
+			}
+		}
+
+		if (set.contains(Handicap.ARMOR_INTOLERANCE)) {
+			for (EquipmentSlot slot : ARMOR_SLOTS) {
+				ItemStack worn = p.getItemBySlot(slot);
+				if (!worn.isEmpty()) {
+					state.rememberArmor(id, slot.name(), BuiltInRegistries.ITEM.getKey(worn.getItem()).toString());
+					ItemStack copy = worn.copy();
+					p.setItemSlot(slot, ItemStack.EMPTY);
+					if (!p.getInventory().add(copy)) {
+						dropItem(p, copy);
+					}
+					overlay(p, Component.literal("Non sopporti di indossare un’armatura!"));
+				}
+			}
+		} else if (!state.armorMemory(id).isEmpty()) {
+			restoreArmor(p);
+		}
+
+		if (set.contains(Handicap.DEMENTIA) && rnd.nextInt(10) == 0) {
+			int a = rnd.nextInt(36);
+			int b = rnd.nextInt(36);
+			if (a != b) {
+				ItemStack ia = p.getInventory().getItem(a).copy();
+				ItemStack ib = p.getInventory().getItem(b).copy();
+				if (!ia.isEmpty() || !ib.isEmpty()) {
+					p.getInventory().setItem(a, ib);
+					p.getInventory().setItem(b, ia);
+				}
+			}
+		}
+
+		if (set.contains(Handicap.POLLEN_ALLERGY) && !p.hasEffect(MobEffects.POISON)) {
+			BlockPos base = p.blockPosition();
+			for (BlockPos pos : BlockPos.betweenClosed(base.offset(-2, -1, -2), base.offset(2, 2, 2))) {
+				if (p.level().getBlockState(pos).is(BlockTags.FLOWERS)) {
+					p.addEffect(new MobEffectInstance(MobEffects.POISON, 100, 0));
+					overlay(p, Component.literal("Etciù! Il polline ti sta avvelenando."));
+					break;
+				}
+			}
+		}
+
+		if (set.contains(Handicap.TOURETTES) && rnd.nextInt(25) == 0) {
+			String word = TOURETTE_WORDS[rnd.nextInt(TOURETTE_WORDS.length)];
+			Component msg = Component.translatable("chat.type.text", p.getDisplayName(), Component.literal(word));
+			server.getPlayerList().broadcastSystemMessage(msg, false);
+		}
+
+		if (rt.announceHold > 0) {
+			rt.announceHold--;
+		}
+		if (rt.wheelchairHint > 0 && rt.wheelchairHint-- <= 6) {
+			overlay(p, Component.literal("Hai bisogno di una sedia a rotelle").withStyle(ChatFormatting.YELLOW));
+		}
+
+		tickPlayerExtra(p, set, rt);
+	}
+
+	private static void tickPlayerExtra(ServerPlayer p, Set<Handicap> set, Runtime rt) {
+		RandomSource rnd = p.getRandom();
+
+		tickMoreHandicaps(p, set, rt, rnd);
+		tickCustomHandicaps(p, set, rt, rnd);
+
+		setModifier(p, Attributes.JUMP_STRENGTH, "paraplegia_jump", -1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			set.contains(Handicap.PARAPLEGIA));
+		setModifier(p, Attributes.MOVEMENT_SPEED, "reduced_mobility", -0.3, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			set.contains(Handicap.REDUCED_MOBILITY));
+		setModifier(p, Attributes.MOVEMENT_SPEED, "celiac_slow", -0.35, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, false);
+		if (!set.contains(Handicap.SEIZURES)) {
+			rt.seizureSeconds = 0;
+		} else {
+			if (rt.seizureSeconds > 0) {
+				rt.seizureSeconds--;
+			} else {
+				boolean hungry = p.getFoodData().getFoodLevel() <= 6 && rnd.nextInt(90) == 0;
+				boolean badEffect = (p.hasEffect(MobEffects.POISON) || p.hasEffect(MobEffects.WITHER)) && rnd.nextInt(20) == 0;
+				if (hungry || badEffect) {
+					startSeizure(p, rt);
+				}
+			}
+		}
+		boolean seizing = rt.seizureSeconds > 0;
+		setModifier(p, Attributes.MOVEMENT_SPEED, "seizure_move", -1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, seizing);
+		setModifier(p, Attributes.JUMP_STRENGTH, "seizure_jump", -1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, seizing);
+
+		if (!set.contains(Handicap.OCD)) {
+			rt.ocdType = 0;
+			rt.ocdCooldown = 30;
+			rt.ocdPunishing = false;
+		} else if (rt.ocdType == 0) {
+			rt.ocdCooldown--;
+			if (rt.ocdCooldown <= 0) {
+				if (rnd.nextBoolean() && !set.contains(Handicap.PARAPLEGIA)) {
+					rt.ocdType = 1;
+					rt.ocdRemaining = 5;
+				} else {
+					rt.ocdType = 2;
+					rt.ocdRemaining = 6;
+				}
+				rt.ocdDeadline = 45;
+			}
+		} else {
+			rt.ocdDeadline--;
+			if (rt.ocdDeadline <= 0) {
+				rt.ocdPunishing = true;
+			}
+		}
+		if (rt.ocdType != 0) {
+			ocdMessage(p, rt);
+		}
+		if (rt.ocdPunishing && rt.ocdType != 0) {
+			p.hurtServer((net.minecraft.server.level.ServerLevel) p.level(), p.damageSources().generic(), 4.0f);
+		}
+
+		long mask = 0L;
+		long mask2 = 0L;
+		for (Handicap d : set) {
+			if (d.high()) {
+				mask2 |= d.bit();
+			} else {
+				mask |= d.bit();
+			}
+		}
+		long off = 0L;
+		long off2 = 0L;
+		for (Handicap d : state.disabled()) {
+			if (d.high()) {
+				off2 |= d.bit();
+			} else {
+				off |= d.bit();
+			}
+		}
+		int flags = (HandicapConfig.permissionLevel() == 0 ? 64 : 0) | (state.sync() ? 32 : 0) | (rt.ocdType != 0 ? 16 : 0) | (seizing ? 1 : 0) | (rt.narcoSeconds > 0 ? 2 : 0) | (HandicapConfig.showDescriptions() ? 4 : 0)
+			| (state.stacking() ? 8 : 0);
+		int timer = state.timerEnabled() ? state.ticksRemaining() : -1;
+		if (HandicapMod.platform().canSend(p)) {
+			HandicapMod.platform().send(p, new SyncPayload(mask, mask2, flags, timer, state.timerSeconds(), state.maxHandicaps(), state.durationSeconds(), off, off2));
+		}
+
+		int limbs = limbsFor(p, set);
+		if (limbs != rt.lastLimbs) {
+			rt.lastLimbs = limbs;
+			broadcastLimbs(p, limbs);
+		}
+	}
+
+	private static int limbsFor(ServerPlayer p, Set<Handicap> set) {
+		int limbs = 0;
+		if (set.contains(Handicap.AMPUTATED_OFFHAND)) {
+			limbs |= p.getMainArm() == HumanoidArm.RIGHT ? LimbsPayload.LEFT_ARM : LimbsPayload.RIGHT_ARM;
+		}
+		if (set.contains(Handicap.AMPUTATED_LEG)) {
+			limbs |= state.legSide(p.getUUID()) == 0 ? LimbsPayload.LEFT_LEG : LimbsPayload.RIGHT_LEG;
+		}
+		if (set.contains(Handicap.BROKEN_ARM)) {
+			limbs |= p.getMainArm() == HumanoidArm.RIGHT ? LimbsPayload.CAST_RIGHT_ARM : LimbsPayload.CAST_LEFT_ARM;
+		}
+		return limbs;
+	}
+
+	private static void broadcastLimbs(ServerPlayer owner, int limbs) {
+		if (server == null) {
+			return;
+		}
+		LimbsPayload payload = new LimbsPayload(owner.getUUID(), limbs);
+		for (ServerPlayer other : server.getPlayerList().getPlayers()) {
+			if (HandicapMod.platform().canSend(other)) {
+				HandicapMod.platform().send(other, payload);
+			}
+		}
+	}
+
+	private static void tickMoreHandicaps(ServerPlayer p, Set<Handicap> set, Runtime rt, RandomSource rnd) {
+		setModifier(p, Attributes.BLOCK_BREAK_SPEED, "broken_arm", -0.65, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			set.contains(Handicap.BROKEN_ARM));
+
+		if (!set.contains(Handicap.SLEEP_APNEA)) {
+			rt.sleepSeconds = 0;
+			rt.apneaRolled = false;
+			rt.apneaSlow = 0;
+		} else {
+			if (p.isSleeping()) {
+				rt.sleepSeconds++;
+				if (!rt.apneaRolled) {
+					rt.apneaRolled = true;
+					rt.apneaWake = rnd.nextInt(10) < 6;
+					rt.apneaWakeAt = 1 + rnd.nextInt(3);
+				}
+				if (rt.apneaWake && rt.sleepSeconds >= rt.apneaWakeAt) {
+					rt.apneaWake = false;
+					p.stopSleepInBed(true, true);
+					rt.apneaSlow = 30;
+					overlay(p, Component.literal("Ti svegli ansimando..."));
+				}
+			} else {
+				rt.sleepSeconds = 0;
+				rt.apneaRolled = false;
+			}
+			if (rt.apneaSlow > 0) {
+				rt.apneaSlow--;
+			}
+		}
+		setModifier(p, Attributes.MOVEMENT_SPEED, "sleep_apnea_slow", -0.35, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.apneaSlow > 0);
+
+		setModifier(p, Attributes.ATTACK_DAMAGE, "muscle_weakness", -0.5, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			set.contains(Handicap.MUSCLE_WEAKNESS));
+
+		if (!set.contains(Handicap.HYPOTENSION)) {
+			rt.hypoSeconds = 0;
+		} else if (rt.hypoSeconds > 0) {
+			rt.hypoSeconds--;
+		} else if (rnd.nextInt(60) == 0) {
+			rt.hypoSeconds = 8;
+			overlay(p, Component.literal("La pressione si abbassa... ti senti debole."));
+		}
+		setModifier(p, Attributes.MOVEMENT_SPEED, "hypotension_slow", -0.45, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.hypoSeconds > 0);
+		setModifier(p, Attributes.ATTACK_DAMAGE, "hypotension_weak", -0.3, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.hypoSeconds > 0);
+
+		if (!set.contains(Handicap.POOR_CIRCULATION)) {
+			rt.idleSeconds = 0;
+			rt.numbSeconds = 0;
+		} else {
+			double dx = p.getX() - rt.lastX;
+			double dz = p.getZ() - rt.lastZ;
+			rt.lastX = p.getX();
+			rt.lastZ = p.getZ();
+			if (dx * dx + dz * dz > 0.04) {
+				rt.idleSeconds = 0;
+			} else {
+				rt.idleSeconds++;
+			}
+			if (rt.numbSeconds > 0) {
+				rt.numbSeconds--;
+			} else if (rt.idleSeconds >= 20) {
+				rt.numbSeconds = 10;
+				rt.idleSeconds = 0;
+				overlay(p, Component.literal("Le gambe sono intorpidite..."));
+			}
+		}
+		setModifier(p, Attributes.MOVEMENT_SPEED, "poor_circulation", -0.45, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.numbSeconds > 0);
+
+		if (!set.contains(Handicap.CLUMSINESS)) {
+			rt.clumsyCooldown = 0;
+		} else if (rt.clumsyCooldown > 0) {
+			rt.clumsyCooldown--;
+		} else if (rnd.nextInt(90) == 0) {
+			ItemStack held = p.getMainHandItem();
+			if (!held.isEmpty()) {
+				ItemStack copy = held.copy();
+				p.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+				dropItem(p, copy);
+				overlay(p, Component.literal("Ops! Ti è scivolato dalle mani."));
+				rt.clumsyCooldown = 60;
+			}
+		}
+
+		if (!set.contains(Handicap.MONSTER_PHOBIA)) {
+			rt.phobiaSeconds = 0;
+		} else {
+			if (rt.phobiaSeconds > 0) {
+				rt.phobiaSeconds--;
+			}
+			List<Monster> near = p.level().getEntitiesOfClass(Monster.class, p.getBoundingBox().inflate(8.0));
+			if (!near.isEmpty()) {
+				if (rt.phobiaSeconds == 0) {
+					overlay(p, Component.literal("C’è un mostro vicino... ti blocchi!"));
+				}
+				rt.phobiaSeconds = 3;
+			}
+		}
+		setModifier(p, Attributes.MOVEMENT_SPEED, "monster_phobia_slow", -0.4, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.phobiaSeconds > 0);
+		setModifier(p, Attributes.ATTACK_DAMAGE, "monster_phobia_weak", -0.4, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.phobiaSeconds > 0);
+
+		if (!set.contains(Handicap.CLAUSTROPHOBIA)) {
+			rt.claustroSeconds = 0;
+		} else {
+			if (rt.claustroSeconds > 0) {
+				rt.claustroSeconds--;
+			}
+			if (isEnclosed(p)) {
+				if (rt.claustroSeconds == 0) {
+					overlay(p, Component.literal("Le pareti ti stanno schiacciando..."));
+				}
+				rt.claustroSeconds = 2;
+			}
+		}
+		setModifier(p, Attributes.MOVEMENT_SPEED, "claustrophobia", -0.35, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.claustroSeconds > 0);
+
+		if (!set.contains(Handicap.SLOW_REFLEXES)) {
+			rt.reflexSeconds = 0;
+		} else if (rt.reflexSeconds > 0) {
+			rt.reflexSeconds--;
+		}
+		setModifier(p, Attributes.MOVEMENT_SPEED, "slow_reflexes", -0.5, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,
+			rt.reflexSeconds > 0);
+	}
+
+	private static void tickCustomHandicaps(ServerPlayer p, Set<Handicap> set, Runtime rt, RandomSource rnd) {
+		// Ludopatia: una scommessa leggera e reversibile su un singolo oggetto della barra rapida.
+		if (!set.contains(Handicap.GAMBLING_ADDICTION)) rt.gamblingTimer = 60;
+		else if (--rt.gamblingTimer <= 0) {
+			rt.gamblingTimer = 60 + rnd.nextInt(61);
+			int slot = rnd.nextInt(9); ItemStack stack = p.getInventory().getItem(slot);
+			if (!stack.isEmpty()) {
+				if (rnd.nextBoolean()) { stack.shrink(1); overlay(p, Component.literal("Hai perso la scommessa: un oggetto è sparito!")); }
+				else if (stack.getCount() < stack.getMaxStackSize()) { stack.grow(1); overlay(p, Component.literal("Hai vinto la scommessa: hai ottenuto un oggetto!")); }
+				else overlay(p, Component.literal("La scommessa è finita in pareggio."));
+			}
+		}
+		// Doom scrolling: brevi pause forzate, senza bloccare permanentemente il giocatore.
+		if (!set.contains(Handicap.DOOM_SCROLLING)) rt.doomTimer = 90;
+		else if (rt.doomActive > 0) rt.doomActive--;
+		else if (--rt.doomTimer <= 0) { rt.doomTimer = 90 + rnd.nextInt(91); rt.doomActive = 3; overlay(p, Component.literal("Doom scrolling... hai perso qualche secondo!")); }
+		setModifier(p, Attributes.MOVEMENT_SPEED, "custom_doom_scroll", -1.0, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, rt.doomActive > 0);
+		if (rt.doomActive > 0) p.addEffect(new MobEffectInstance(MobEffects.BLINDNESS, 25, 0, false, false, false));
+
+		if (!set.contains(Handicap.PROCRASTINATION)) { rt.procrastinationTimer=35; rt.procrastinationActive=0; }
+		else if (rt.procrastinationActive > 0) rt.procrastinationActive--;
+		else if (--rt.procrastinationTimer <= 0) { rt.procrastinationTimer=35+rnd.nextInt(36); rt.procrastinationActive=5; overlay(p, Component.literal("Domani lo farai... forse.")); }
+		setModifier(p, Attributes.BLOCK_BREAK_SPEED, "custom_procrastination_mine", -0.8, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, rt.procrastinationActive>0);
+		setModifier(p, Attributes.MOVEMENT_SPEED, "custom_procrastination_move", -0.65, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, rt.procrastinationActive>0);
+
+		if (!set.contains(Handicap.PARANOIA)) rt.paranoiaTimer=20;
+		else if (--rt.paranoiaTimer<=0) { rt.paranoiaTimer=20+rnd.nextInt(31); overlay(p, Component.literal("Hai sentito qualcosa alle tue spalle...")); if(rnd.nextBoolean()) p.addEffect(new MobEffectInstance(MobEffects.WEAKNESS, 60, 0)); }
+
+		if (!set.contains(Handicap.SHOPPING_COMPULSIVE)) rt.shoppingTimer=90;
+		else if (--rt.shoppingTimer<=0) { rt.shoppingTimer=90+rnd.nextInt(61); for(int i=0;i<36;i++){ ItemStack st=p.getInventory().getItem(i); if(st.is(Items.EMERALD)){ st.shrink(1); overlay(p, Component.literal("Shopping compulsivo: hai speso uno smeraldo!")); break; } } }
+
+		if (!set.contains(Handicap.INVENTORY_DISORDER)) rt.inventoryChaosTimer=30;
+		else if (--rt.inventoryChaosTimer<=0) { rt.inventoryChaosTimer=30+rnd.nextInt(31); int a=rnd.nextInt(36), b=rnd.nextInt(36); if(a!=b){ ItemStack ia=p.getInventory().getItem(a).copy(), ib=p.getInventory().getItem(b).copy(); p.getInventory().setItem(a,ib); p.getInventory().setItem(b,ia); } overlay(p, Component.literal("Che confusione... l’inventario si è riordinato da solo!")); }
+
+		if (!set.contains(Handicap.INDECISION)) { rt.indecisionTimer=25; rt.indecisionActive=0; }
+		else if(rt.indecisionActive>0) rt.indecisionActive--; else if(--rt.indecisionTimer<=0){rt.indecisionTimer=25+rnd.nextInt(26);rt.indecisionActive=3;overlay(p,Component.literal("Ehm... cosa stavi facendo?"));}
+		setModifier(p, Attributes.MOVEMENT_SPEED, "custom_indecision", -0.55, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL, rt.indecisionActive>0);
+
+		if (!set.contains(Handicap.BAD_LUCK)) rt.badLuckTimer=45;
+		else if(--rt.badLuckTimer<=0){rt.badLuckTimer=45+rnd.nextInt(46);p.addEffect(new MobEffectInstance(MobEffects.WEAKNESS,80,0));overlay(p,Component.literal("Oggi non è proprio la tua giornata..."));}
+
+		if(set.contains(Handicap.FOOD_DEPENDENCE) && p.getFoodData().getFoodLevel()<=14) setModifier(p,Attributes.ATTACK_DAMAGE,"custom_food_weak",-0.35,AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,true);
+		else setModifier(p,Attributes.ATTACK_DAMAGE,"custom_food_weak",-0.35,AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,false);
+
+		if (!set.contains(Handicap.DISTRACTION)){rt.distractionTimer=30;rt.distractionActive=0;}
+		else if(rt.distractionActive>0)rt.distractionActive--;else if(--rt.distractionTimer<=0){rt.distractionTimer=30+rnd.nextInt(31);rt.distractionActive=2;overlay(p,Component.literal("Ops, ti sei distratto!"));}
+		setModifier(p,Attributes.MOVEMENT_SPEED,"custom_distraction",-1.0,AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,rt.distractionActive>0);
+
+		if(!set.contains(Handicap.FOMO))rt.fomoTimer=55;else if(--rt.fomoTimer<=0){rt.fomoTimer=55+rnd.nextInt(46);overlay(p,Component.literal("Ti stai perdendo qualcosa? Meglio controllare!"));}
+		if(!set.contains(Handicap.OVERTHINKING))rt.overthinkingTimer=20;else if(--rt.overthinkingTimer<=0){rt.overthinkingTimer=20+rnd.nextInt(21);if(p.getDeltaMovement().horizontalDistanceSqr()>0.01)overlay(p,Component.literal("Stai pensando troppo..."));}
+		setModifier(p,Attributes.MOVEMENT_SPEED,"custom_overthinking",-0.2,AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL,set.contains(Handicap.OVERTHINKING)&&p.getDeltaMovement().horizontalDistanceSqr()>0.01);
+	}
+
+	// ServerPlayer.drop gained a Prediction parameter in 26.3, so spawn the item ourselves.
+	private static void dropItem(ServerPlayer p, ItemStack stack) {
+		if (stack.isEmpty()) {
+			return;
+		}
+		ServerLevel level = (ServerLevel) p.level();
+		ItemEntity entity = new ItemEntity(level, p.getX(), p.getEyeY() - 0.3, p.getZ(), stack);
+		entity.setPickUpDelay(40);
+		Vec3 look = p.getLookAngle();
+		entity.setDeltaMovement(look.x * 0.3, 0.1, look.z * 0.3);
+		level.addFreshEntity(entity);
+	}
+
+	// Kleptomania safety net: whatever path the drop took (inventory, creative, key), take it back.
+	private static void recoverThrownItems(ServerPlayer p) {
+		ServerLevel level = (ServerLevel) p.level();
+		for (ItemEntity e : level.getEntitiesOfClass(ItemEntity.class, p.getBoundingBox().inflate(5.0),
+				ie -> ie.tickCount < 10 && ie.getOwner() == p)) {
+			ItemStack stack = e.getItem().copy();
+			if (p.getInventory().add(stack)) {
+				e.discard();
+				overlay(p, Component.literal("Non riesci a lasciare questo oggetto!"));
+			}
+		}
+	}
+
+	private static void restoreArmor(ServerPlayer p) {
+		UUID id = p.getUUID();
+		Map<String, String> memory = state.armorMemory(id);
+		for (EquipmentSlot slot : ARMOR_SLOTS) {
+			String itemId = memory.get(slot.name());
+			if (itemId == null || !p.getItemBySlot(slot).isEmpty()) {
+				continue;
+			}
+			for (int i = 0; i < 36; i++) {
+				ItemStack stack = p.getInventory().getItem(i);
+				if (!stack.isEmpty() && BuiltInRegistries.ITEM.getKey(stack.getItem()).toString().equals(itemId)) {
+					p.setItemSlot(slot, stack.copy());
+					p.getInventory().setItem(i, ItemStack.EMPTY);
+					break;
+				}
+			}
+		}
+		state.clearArmorMemory(id);
+		overlay(p, Component.literal("Your armor is back on."));
+	}
+
+	private static boolean isEnclosed(ServerPlayer p) {
+		BlockPos base = p.blockPosition();
+		int solid = 0;
+		for (BlockPos pos : BlockPos.betweenClosed(base.offset(-2, 0, -2), base.offset(2, 2, 2))) {
+			if (!p.level().getBlockState(pos).getCollisionShape(p.level(), pos).isEmpty()) {
+				solid++;
+			}
+		}
+		return solid >= 52;
+	}
+
+	private static void announce(ServerPlayer p, Component message) {
+		RUNTIME.computeIfAbsent(p.getUUID(), k -> new Runtime()).announceHold = 3;
+		p.sendOverlayMessage(message);
+	}
+
+	private static void overlay(ServerPlayer p, Component message) {
+		Runtime rt = RUNTIME.get(p.getUUID());
+		if (rt == null || (rt.ocdType == 0 && rt.announceHold == 0)) {
+			p.sendOverlayMessage(message);
+		}
+	}
+
+	private static void ocdMessage(ServerPlayer p, Runtime rt) {
+		if (rt.ocdRemaining <= 0 || rt.announceHold > 0) {
+			return;
+		}
+		String task = (rt.ocdType == 1 ? "Jump " : "Sneak ") + rt.ocdRemaining + " more time" + (rt.ocdRemaining > 1 ? "s" : "");
+		p.sendOverlayMessage(rt.ocdPunishing
+			? Component.literal("Obey your compulsion! · " + task).withStyle(ChatFormatting.RED)
+			: Component.literal(task + " · " + Math.max(0, rt.ocdDeadline) + "s").withStyle(ChatFormatting.LIGHT_PURPLE));
+	}
+
+	private static void startSeizure(ServerPlayer p, Runtime rt) {
+		rt.seizureSeconds = 6;
+		overlay(p, Component.literal("Seizure!"));
+	}
+
+	private static void tickFast(ServerPlayer p) {
+		UUID id = p.getUUID();
+		Runtime rt = RUNTIME.computeIfAbsent(id, k -> new Runtime());
+
+		boolean lactose = state.has(id, Handicap.LACTOSE_INTOLERANCE);
+		boolean diabetes = state.has(id, Handicap.DIABETES);
+		boolean celiac = state.has(id, Handicap.CELIAC);
+		boolean fishAllergy = state.has(id, Handicap.FISH_ALLERGY);
+		if (lactose || diabetes || celiac || fishAllergy) {
+			if (p.isUsingItem()) {
+				rt.useItem = p.getUseItem().copy();
+				rt.useRemaining = p.getUseItemRemainingTicks();
+			} else if (rt.useItem != null) {
+				if (rt.useRemaining <= 2) {
+					onConsumed(p, rt.useItem, lactose, diabetes, celiac, fishAllergy);
+				}
+				rt.useItem = null;
+			}
+		} else {
+			rt.useItem = null;
+		}
+
+		if (state.has(id, Handicap.KLEPTOMANIA) && p.isAlive()) {
+			recoverThrownItems(p);
+		}
+
+		float health = p.getHealth();
+		if (state.has(id, Handicap.SEIZURES)) {
+			if (rt.lastHealth >= 0f && health < rt.lastHealth - 0.5f && rt.seizureSeconds == 0 && p.getRandom().nextInt(5) == 0) {
+				startSeizure(p, rt);
+			}
+		}
+		if (state.has(id, Handicap.SLOW_REFLEXES) && rt.lastHealth >= 0f && health < rt.lastHealth - 0.01f) {
+			rt.reflexSeconds = 4;
+		}
+		rt.lastHealth = health;
+
+		if (state.has(id, Handicap.RESPIRATORY_FAILURE) && p.isUnderWater() && !p.hasEffect(MobEffects.WATER_BREATHING)) {
+			p.setAirSupply(p.getAirSupply() - 1);
+		}
+
+		boolean onGround = p.onGround();
+		boolean sneaking = p.isShiftKeyDown();
+		if (state.has(id, Handicap.OCD) && rt.ocdType != 0) {
+			if (rt.ocdType == 1 && rt.lastOnGround && !onGround && p.getDeltaMovement().y > 0.2) {
+				rt.ocdRemaining--;
+				ocdMessage(p, rt);
+			} else if (rt.ocdType == 2 && sneaking && !rt.lastSneak) {
+				rt.ocdRemaining--;
+				ocdMessage(p, rt);
+			}
+			if (rt.ocdRemaining <= 0) {
+				rt.ocdType = 0;
+				rt.ocdPunishing = false;
+				rt.ocdCooldown = 60 + p.getRandom().nextInt(120);
+				p.sendOverlayMessage(Component.literal("Compulsion fulfilled").withStyle(ChatFormatting.GREEN));
+			}
+		}
+		rt.lastOnGround = onGround;
+		rt.lastSneak = sneaking;
+	}
+
+	private static void onConsumed(ServerPlayer p, ItemStack item, boolean lactose, boolean diabetes, boolean celiac,
+			boolean fishAllergy) {
+		if (fishAllergy && (item.is(Items.COD) || item.is(Items.SALMON) || item.is(Items.COOKED_COD)
+			|| item.is(Items.COOKED_SALMON) || item.is(Items.TROPICAL_FISH) || item.is(Items.PUFFERFISH))) {
+			p.sendSystemMessage(Component.literal("Your fish allergy was fatal...").withStyle(ChatFormatting.RED));
+			p.kill((ServerLevel) p.level());
+			return;
+		}
+		if (celiac && (item.is(Items.BREAD) || item.is(Items.COOKIE))) {
+			p.sendSystemMessage(Component.literal("Your celiac disease was fatal...").withStyle(ChatFormatting.RED));
+			p.kill((ServerLevel) p.level());
+			return;
+		}
+		if (lactose && item.is(Items.MILK_BUCKET)) {
+			p.sendSystemMessage(Component.literal("Your lactose intolerance was fatal...").withStyle(ChatFormatting.RED));
+			p.kill((ServerLevel) p.level());
+			return;
+		}
+		if (diabetes) {
+			int damage = sugarDamage(item);
+			if (damage > 0) {
+				p.setHealth(Math.max(1.0f, p.getHealth() - damage));
+				overlay(p, Component.literal("Too much sugar..."));
+			}
+		}
+	}
+
+	private static int sugarDamage(ItemStack item) {
+		if (item.is(Items.HONEY_BOTTLE) || item.is(Items.PUMPKIN_PIE)) {
+			return 4;
+		}
+		if (item.is(Items.COOKIE) || item.is(Items.SWEET_BERRIES) || item.is(Items.GLOW_BERRIES) || item.is(Items.MELON_SLICE)) {
+			return 1;
+		}
+		return 0;
+	}
+
+	private static void setModifier(ServerPlayer p, Holder<Attribute> attribute, String name, double amount,
+			AttributeModifier.Operation operation, boolean active) {
+		AttributeInstance inst = p.getAttribute(attribute);
+		if (inst == null) {
+			return;
+		}
+		Identifier id = HandicapMod.id(name);
+		AttributeModifier existing = inst.getModifier(id);
+		if (active) {
+			if (existing == null || existing.amount() != amount) {
+				inst.addOrReplacePermanentModifier(new AttributeModifier(id, amount, operation));
+			}
+		} else if (existing != null) {
+			inst.removeModifier(id);
+		}
+	}
+}

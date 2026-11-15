@@ -1,0 +1,41 @@
+{
+	"schemaVersion": 1,
+	"id": "handicap",
+	"version": "${version}",
+	"name": "Handicap",
+	"description": "Gain a random handicap at regular intervals.",
+	"authors": [
+		"FERSPI"
+	],
+	"contact": {
+		"homepage": "https://www.curseforge.com/minecraft/mc-mods/handicap",
+		"source":"https://github.com/FERSPl/Handicap"
+	},
+	"license": "LGPLv3",
+	"icon": "assets/handicap/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.handicap.fabric.HandicapFabric"
+		],
+		"client": [
+			"com.handicap.fabric.client.HandicapFabricClient"
+		],
+		"modmenu": [
+			"com.handicap.fabric.client.HandicapModMenu"
+		]
+	},
+	"depends": {
+		"fabricloader": "*",
+		"minecraft": "${minecraft_range}",
+		"java": ">=25",
+		"fabric-api": "*"
+	},
+	"mixins": [
+		"handicap.mixins.json",
+		{
+			"config": "handicap.client.mixins.json",
+			"environment": "client"
+		}
+	]
+}
